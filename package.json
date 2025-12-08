@@ -1,0 +1,21 @@
+{
+    "name": "personal-website",
+    "version": "1.0.0",
+    "description": "My Personal Portfolio Website",
+    "main": "src/app.js",
+    "scripts": {
+        "start": "node src/app.js",
+        "dev": "nodemon src/app.js"
+    },
+    "keywords": [
+        "portfolio",
+        "personal",
+        "website",
+        "express"
+    ],
+    "author": "",
+    "license": "ISC",
+    "dependencies": {
+        "express": "^4.18.2"
+    }
+}
