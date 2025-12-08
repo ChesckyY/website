@@ -60,5 +60,5 @@ sudo systemctl start rusdi
 ## 5. GitHub Secrets
 On your GitHub repo, go to **Settings > Secrets and variables > Actions** and add:
 - `SSH_HOST`: `202.10.38.230`
-- `SSH_USERNAME`: `cyber`
+- `SSH_USERNAME`: `cyber` (Note: Ensure this matches the secret name used in `deploy.yml`, which is now `SSH_USER`)
 - `SSH_KEY`: (Your private SSH key content)
