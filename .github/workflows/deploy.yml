@@ -1,12 +1,9 @@
 name: deploy-ssh
 on:
-  # Memungkinkan untuk dijalankan secara manual dari UI GitHub
-  workflow_dispatch:
-  # Jalan otomatis saat Release baru dibuat dan di-publish
+  workflow_dispatch: # Bisa dijalankan manual
   release:
-    types: [published]
+    types: [published] # Jalan otomatis saat Release baru dibuat
 
-# Mencegah deployment ganda pada ref yang sama
 concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: true
@@ -14,7 +11,6 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    
     steps:
       # 1. Download artifact (zip) dari Release GitHub
       - name: Download app.zip from latest release
@@ -23,15 +19,15 @@ jobs:
           repository: ${{ github.repository }}
           latest: true
           fileName: "app.zip"
-      
-      # 2. Daftarkan Host Key Server (untuk keamanan)
-      - name: Add server host key to known_hosts
+
+      # 2. Daftarkan Host Key Server (mencegah Man-in-the-Middle)
+      - name: Add server host key (pin)
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
-      
+
       # 3. Copy file zip ke server
       - name: Copy app.zip to server
         uses: appleboy/scp-action@v0.1.7
@@ -40,9 +36,8 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           source: "app.zip"
-          # Target direktori diganti dari /srv/hello/ menjadi /srv/rusdi/
           target: "/srv/rusdi/"
-      
+
       # 4. Eksekusi Deployment via SSH
       - name: Deploy via SSH (atomic release + systemd)
         uses: appleboy/ssh-action@v1.1.0
@@ -51,17 +46,14 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           script: |
-            # Setel untuk keluar segera jika ada perintah yang gagal
             set -euo pipefail
-            
-            # Ubah direktori ke folder aplikasi Rusdi
             cd /srv/rusdi
 
             # Buat folder release unik berdasarkan waktu
             ts="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
             mkdir -p "releases/$ts"
 
-            # Unzip aplikasi ke folder release baru
+            # Unzip aplikasi
             unzip -o app.zip -d "releases/$ts"
 
             # Install dependencies (production only)
@@ -73,17 +65,14 @@ jobs:
             fi
 
             # Update symlink 'current' ke versi terbaru (Atomic Switch)
-            # Path symlink diganti dari /srv/hello/... menjadi /srv/rusdi/...
             ln -sfn "/srv/rusdi/releases/$ts" /srv/rusdi/current
 
-            # Restart service (Nama service diganti dari hello menjadi rusdi)
+            # Restart service
             sudo systemctl restart rusdi
 
             # Health Check (Tunggu 5 detik agar service boot up)
             sleep 5
-            # Periksa port yang sama, log service juga diganti menjadi rusdi
             curl -fsS http://localhost:3000/health || (sudo journalctl -u rusdi -n 50 --no-pager; exit 1)
 
             # Bersihkan rilis lama (sisakan 5 terbaru)
-            # Path cleanup diganti dari /srv/hello/... menjadi /srv/rusdi/...
             ls -1dt /srv/rusdi/releases/* | tail -n +6 | xargs -r rm -rf
