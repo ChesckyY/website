@@ -70,9 +70,9 @@ jobs:
             # Restart service
             sudo systemctl restart rusdi
 
-            # Health Check (Tunggu 5 detik agar service boot up)
-            sleep 5
-            curl -fsS http://localhost:3000/health || (sudo journalctl -u rusdi -n 50 --no-pager; exit 1)
+            # Health Check (Tunggu 15 detik agar service boot up)
+            sleep 15
+            curl -fsS http://localhost:3000/health || (echo "Health check failed! Last logs:"; journalctl -u rusdi -n 50 --no-pager; exit 1)
 
             # Bersihkan rilis lama (sisakan 5 terbaru)
             ls -1dt /srv/rusdi/releases/* | tail -n +6 | xargs -r rm -rf
