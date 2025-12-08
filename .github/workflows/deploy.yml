@@ -1,50 +1,89 @@
-name: Deploy to Rusdi Server
-
+name: deploy-ssh
 on:
-  push:
-    branches:
-      - main
+  # Memungkinkan untuk dijalankan secara manual dari UI GitHub
+  workflow_dispatch:
+  # Jalan otomatis saat Release baru dibuat dan di-publish
+  release:
+    types: [published]
+
+# Mencegah deployment ganda pada ref yang sama
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v3
+      # 1. Download artifact (zip) dari Release GitHub
+      - name: Download app.zip from latest release
+        uses: robinraju/release-downloader@v1.11
         with:
-          node-version: '18'
-
-      - name: Install dependencies (Build Check)
-        run: npm ci
-
-      - name: Deploy to Server via Rsync
-        uses: easingthemes/ssh-deploy@v4
+          repository: ${{ github.repository }}
+          latest: true
+          fileName: "app.zip"
+      
+      # 2. Daftarkan Host Key Server (untuk keamanan)
+      - name: Add server host key to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
         env:
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_KEY }}
-          ARGS: "-rltgoDzvO"
-          SOURCE: "."
-          REMOTE_HOST: ${{ secrets.SSH_HOST }}
-          REMOTE_USER: ${{ secrets.SSH_USERNAME }}
-          TARGET: "/srv/rusdi/current"
-          EXCLUDE: "/node_modules/, /.git/, /.github/, /SERVER_SETUP.md"
-
-      - name: Restart Application
-        uses: appleboy/ssh-action@master
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+      
+      # 3. Copy file zip ke server
+      - name: Copy app.zip to server
+        uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USERNAME }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          source: "app.zip"
+          # Target direktori diganti dari /srv/hello/ menjadi /srv/rusdi/
+          target: "/srv/rusdi/"
+      
+      # 4. Eksekusi Deployment via SSH
+      - name: Deploy via SSH (atomic release + systemd)
+        uses: appleboy/ssh-action@v1.1.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           script: |
-            # Ensure target directory exists and has permissions (safety check)
-            sudo mkdir -p /srv/rusdi/current
-            sudo chown -R cyber:cyber /srv/rusdi
+            # Setel untuk keluar segera jika ada perintah yang gagal
+            set -euo pipefail
             
-            # Install production dependencies on server
-            cd /srv/rusdi/current
-            npm install --production
-            
-            # Restart service
+            # Ubah direktori ke folder aplikasi Rusdi
+            cd /srv/rusdi
+
+            # Buat folder release unik berdasarkan waktu
+            ts="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
+            mkdir -p "releases/$ts"
+
+            # Unzip aplikasi ke folder release baru
+            unzip -o app.zip -d "releases/$ts"
+
+            # Install dependencies (production only)
+            cd "releases/$ts"
+            if [ -f "package-lock.json" ]; then
+              npm ci --omit=dev
+            else
+              npm install --omit=dev
+            fi
+
+            # Update symlink 'current' ke versi terbaru (Atomic Switch)
+            # Path symlink diganti dari /srv/hello/... menjadi /srv/rusdi/...
+            ln -sfn "/srv/rusdi/releases/$ts" /srv/rusdi/current
+
+            # Restart service (Nama service diganti dari hello menjadi rusdi)
             sudo systemctl restart rusdi
+
+            # Health Check (Tunggu 5 detik agar service boot up)
+            sleep 5
+            # Periksa port yang sama, log service juga diganti menjadi rusdi
+            curl -fsS http://localhost:3000/health || (sudo journalctl -u rusdi -n 50 --no-pager; exit 1)
+
+            # Bersihkan rilis lama (sisakan 5 terbaru)
+            # Path cleanup diganti dari /srv/hello/... menjadi /srv/rusdi/...
+            ls -1dt /srv/rusdi/releases/* | tail -n +6 | xargs -r rm -rf
