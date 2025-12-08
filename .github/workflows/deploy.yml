@@ -1,8 +1,8 @@
 name: deploy-ssh
 on:
-  workflow_dispatch: # Bisa dijalankan manual
+  workflow_dispatch:
   release:
-    types: [published] # Jalan otomatis saat Release baru dibuat
+    types: [published]
 
 concurrency:
   group: deploy-${{ github.ref }}
@@ -12,7 +12,6 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      # 1. Download artifact (zip) dari Release GitHub
       - name: Download app.zip from latest release
         uses: robinraju/release-downloader@v1.11
         with:
@@ -20,59 +19,55 @@ jobs:
           latest: true
           fileName: "app.zip"
 
-      # 2. Daftarkan Host Key Server (mencegah Man-in-the-Middle)
-      - name: Add server host key (pin)
-        run: |
-          mkdir -p ~/.ssh
-          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
-        env:
-          SSH_HOST: ${{ secrets.SSH_HOST }}
-
-      # 3. Copy file zip ke server
+      # Removed ssh-keyscan to avoid rate-limiting issues (Connection Reset)
+      
       - name: Copy app.zip to server
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
+          port: 22
           source: "app.zip"
-          target: "/srv/rusdi/"
+          target: "/srv/rusdi/" # Upload to /tmp first to avoid permission issues
+          timeout: 60s
+          command_timeout: 10m
 
-      # 4. Eksekusi Deployment via SSH
       - name: Deploy via SSH (atomic release + systemd)
         uses: appleboy/ssh-action@v1.1.0
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
+          port: 22
           script: |
             set -euo pipefail
-            cd /srv/rusdi
-
-            # Buat folder release unik berdasarkan waktu
+            
+            # Create release folder
             ts="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
-            mkdir -p "releases/$ts"
+            mkdir -p "/srv/rusdi/releases/$ts"
 
-            # Unzip aplikasi
-            unzip -o app.zip -d "releases/$ts"
+            # Unzip from temp
+            unzip -o /tmp/app.zip -d "/srv/rusdi/releases/$ts"
+            rm /tmp/app.zip
 
-            # Install dependencies (production only)
-            cd "releases/$ts"
+            # Install dependencies
+            cd "/srv/rusdi/releases/$ts"
             if [ -f "package-lock.json" ]; then
               npm ci --omit=dev
             else
               npm install --omit=dev
             fi
 
-            # Update symlink 'current' ke versi terbaru (Atomic Switch)
+            # Update symlink
             ln -sfn "/srv/rusdi/releases/$ts" /srv/rusdi/current
 
             # Restart service
             sudo systemctl restart rusdi
 
-            # Health Check (Tunggu 15 detik agar service boot up)
+            # Health Check
             sleep 15
             curl -fsS http://localhost:3000/health || (echo "Health check failed! Last logs:"; journalctl -u rusdi -n 50 --no-pager; exit 1)
 
-            # Bersihkan rilis lama (sisakan 5 terbaru)
+            # Cleanup
             ls -1dt /srv/rusdi/releases/* | tail -n +6 | xargs -r rm -rf
