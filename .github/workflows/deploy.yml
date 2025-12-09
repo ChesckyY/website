@@ -39,52 +39,106 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           port: 22
           script: |
+            #!/usr/bin/env bash
             set -euo pipefail
-            
-            # Create release folder
+
+            service="rusdi"
+            release_dir="/srv/rusdi/releases"
+            current_link="/srv/rusdi/current"
+
+            # Timestamped release dir
             ts="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
-            mkdir -p "/srv/rusdi/releases/$ts"
+            mkdir -p "${release_dir}/${ts}"
 
-            # Unzip from /srv/rusdi/app.zip (since we uploaded there)
-            unzip -o /srv/rusdi/app.zip -d "/srv/rusdi/releases/$ts"
-            rm /srv/rusdi/app.zip
+            # Unzip uploaded artifact and remove the zip
+            unzip -o /srv/rusdi/app.zip -d "${release_dir}/${ts}"
+            rm -f /srv/rusdi/app.zip
 
-            # Install dependencies
-            cd "/srv/rusdi/releases/$ts"
-            if [ -f "package-lock.json" ]; then
+            # Install production dependencies
+            cd "${release_dir}/${ts}"
+            if [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ]; then
               npm ci --omit=dev
             else
               npm install --omit=dev
             fi
 
-            # Update symlink
-            ln -sfn "/srv/rusdi/releases/$ts" /srv/rusdi/current
+            # Update current symlink atomically
+            ln -sfn "${release_dir}/${ts}" "${current_link}"
 
-            # Restart service
-            sudo systemctl restart rusdi
+            # Helper: run command with non-interactive sudo if available, else run as root if already root
+            run_priv() {
+              if sudo -n true 2>/dev/null; then
+                sudo -n "$@"
+              elif [ "$(id -u)" -eq 0 ]; then
+                "$@"
+              else
+                return 2
+              fi
+            }
 
-            # Health Check with retries (wait for slow startups)
+            # Restart service (fail with actionable message if not allowed)
+            if ! run_priv systemctl restart "${service}"; then
+              echo "ERROR: cannot restart ${service} non-interactively because sudo would prompt for a password and you're not root."
+              echo "Fix options (choose one):"
+              echo "  1) Allow the deploy user passwordless sudo for the minimal commands:"
+              echo "     Create /etc/sudoers.d/github-ci containing:"
+              echo "       ${USER:-deploy} ALL=(ALL) NOPASSWD: /bin/systemctl, /usr/bin/journalctl"
+              echo "     (replace ${USER:-deploy} with the actual deploy username)"
+              echo "  2) Run the workflow as a user with permission to restart services (or run the action as root)."
+              exit 1
+            fi
+
+            # Health check with retries
             max_retries=6
             sleep_between=5
-            attempt=0
             success=0
-            while [ $attempt -lt $max_retries ]; do
-              attempt=$((attempt + 1))
-              sleep $sleep_between
+
+            for attempt in $(seq 1 $max_retries); do
               if curl -fsS http://localhost:3000/health >/dev/null 2>&1; then
                 success=1
                 echo "Health check passed on attempt $attempt"
                 break
               fi
               echo "Health check attempt $attempt/$max_retries failed; retrying..."
+              if [ "$attempt" -lt "$max_retries" ]; then
+                sleep "$sleep_between"
+              fi
             done
 
             if [ "$success" -ne 1 ]; then
-              echo "Health check failed! Last logs:"
-              # Show recent logs for the rusdi service, or general system logs if that fails
-              sudo journalctl -u rusdi -n 200 --no-pager -o cat || sudo journalctl -xe --no-pager -n 200
+              echo "Health check failed! Collecting logs and status..."
+
+              # Try journalctl without sudo first, then with non-interactive sudo
+              if journalctl -u "${service}" -n 200 --no-pager -o cat >/dev/null 2>&1; then
+                echo "---- journalctl (without sudo) ----"
+                journalctl -u "${service}" -n 200 --no-pager -o cat || true
+              elif sudo -n journalctl -u "${service}" -n 200 --no-pager -o cat >/dev/null 2>&1; then
+                echo "---- journalctl (with sudo -n) ----"
+                sudo -n journalctl -u "${service}" -n 200 --no-pager -o cat || true
+              else
+                echo "Cannot run 'journalctl' non-interactively (sudo would prompt)."
+                echo "Showing fallback logs (if available):"
+                if [ -f /var/log/syslog ]; then
+                  echo "---- /var/log/syslog (last 200 lines) ----"
+                  tail -n 200 /var/log/syslog || true
+                elif [ -f /var/log/messages ]; then
+                  echo "---- /var/log/messages (last 200 lines) ----"
+                  tail -n 200 /var/log/messages || true
+                else
+                  echo "No fallback logs found."
+                fi
+              fi
+
+              # Show systemctl status if possible (non-interactive)
+              if run_priv systemctl status "${service}" --no-pager >/dev/null 2>&1; then
+                echo "---- systemctl status ----"
+                run_priv systemctl status "${service}" --no-pager || true
+              else
+                echo "Cannot run 'systemctl status' non-interactively."
+              fi
+
               exit 1
             fi
 
-            # Cleanup (keep 5 most recent)
-            ls -1dt /srv/rusdi/releases/* | tail -n +6 | xargs -r rm -rf
+            # Cleanup old releases (keep 5 most recent)
+            ls -1dt "${release_dir}"/* 2>/dev/null | tail -n +6 | xargs -r rm -rf || true
