@@ -82,8 +82,8 @@ jobs:
               echo "Fix options (choose one):"
               echo "  1) Allow the deploy user passwordless sudo for the minimal commands:"
               echo "     Create /etc/sudoers.d/github-ci containing:"
-              echo "       ${USER:-deploy} ALL=(ALL) NOPASSWD: /bin/systemctl, /usr/bin/journalctl"
-              echo "     (replace ${USER:-deploy} with the actual deploy username)"
+              echo "       cyber ALL=(ALL) NOPASSWD: /bin/systemctl, /usr/bin/journalctl"
+              echo "     (replace 'cyber' with the actual deploy username if different)"
               echo "  2) Run the workflow as a user with permission to restart services (or run the action as root)."
               exit 1
             fi
