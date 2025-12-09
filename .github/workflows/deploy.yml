@@ -1,8 +1,8 @@
 name: deploy-ssh
 on:
-  workflow_dispatch:
+  workflow_dispatch: # Bisa dijalankan manual
   release:
-    types: [published]
+    types: [published] # Jalan otomatis saat Release baru dibuat
 
 concurrency:
   group: deploy-${{ github.ref }}
@@ -12,6 +12,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
+      # 1. Download artifact (zip) dari Release GitHub
       - name: Download app.zip from latest release
         uses: robinraju/release-downloader@v1.11
         with:
@@ -19,126 +20,60 @@ jobs:
           latest: true
           fileName: "app.zip"
 
+      # 2. Daftarkan Host Key Server (mencegah Man-in-the-Middle)
+      - name: Add server host key (pin)
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+
+      # 3. Copy file zip ke server
       - name: Copy app.zip to server
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
-          port: 22
           source: "app.zip"
-          target: "/srv/rusdi/" # User requested change back to /srv/rusdi/
-          timeout: 60s
-          command_timeout: 10m
+          target: "/srv/rusdi/"
 
+      # 4. Eksekusi Deployment via SSH
       - name: Deploy via SSH (atomic release + systemd)
         uses: appleboy/ssh-action@v1.1.0
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
-          port: 22
           script: |
-            #!/usr/bin/env bash
             set -euo pipefail
+            cd /srv/rusdi
 
-            service="rusdi"
-            release_dir="/srv/rusdi/releases"
-            current_link="/srv/rusdi/current"
-
-            # Timestamped release dir
+            # Buat folder release unik berdasarkan waktu
             ts="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
-            mkdir -p "${release_dir}/${ts}"
+            mkdir -p "releases/$ts"
 
-            # Unzip uploaded artifact and remove the zip
-            unzip -o /srv/rusdi/app.zip -d "${release_dir}/${ts}"
-            rm -f /srv/rusdi/app.zip
+            # Unzip aplikasi
+            unzip -o app.zip -d "releases/$ts"
 
-            # Install production dependencies
-            cd "${release_dir}/${ts}"
-            if [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ]; then
+            # Install dependencies (production only)
+            cd "releases/$ts"
+            if [ -f "package-lock.json" ]; then
               npm ci --omit=dev
             else
               npm install --omit=dev
             fi
 
-            # Update current symlink atomically
-            ln -sfn "${release_dir}/${ts}" "${current_link}"
+            # Update symlink 'current' ke versi terbaru (Atomic Switch)
+            ln -sfn "/srv/rusdi/releases/$ts" /srv/rusdi/current
 
-            # Helper: run command with non-interactive sudo if available, else run as root if already root
-            run_priv() {
-              if sudo -n true 2>/dev/null; then
-                sudo -n "$@"
-              elif [ "$(id -u)" -eq 0 ]; then
-                "$@"
-              else
-                return 2
-              fi
-            }
+            # Restart service
+            sudo systemctl restart rusdi
 
-            # Restart service (fail with actionable message if not allowed)
-            if ! run_priv systemctl restart "${service}"; then
-              echo "ERROR: cannot restart ${service} non-interactively because sudo would prompt for a password and you're not root."
-              echo "Fix options (choose one):"
-              echo "  1) Allow the deploy user passwordless sudo for the minimal commands:"
-              echo "     Create /etc/sudoers.d/github-ci containing:"
-              echo "       cyber ALL=(ALL) NOPASSWD: /bin/systemctl, /usr/bin/journalctl"
-              echo "     (replace 'cyber' with the actual deploy username if different)"
-              echo "  2) Run the workflow as a user with permission to restart services (or run the action as root)."
-              exit 1
-            fi
+            # Health Check (Tunggu 5 detik agar service boot up)
+            sleep 5
+            # Log error pakai tail karena sudo journalctl mungkin butuh password
+            curl -fsS http://localhost:3000/health || (echo "Health check failed! Last logs:" && tail -n 50 /var/log/rusdi/rusdi.err.log && exit 1)
 
-            # Health check with retries
-            max_retries=6
-            sleep_between=5
-            success=0
-
-            for attempt in $(seq 1 $max_retries); do
-              if curl -fsS http://localhost:3000/health >/dev/null 2>&1; then
-                success=1
-                echo "Health check passed on attempt $attempt"
-                break
-              fi
-              echo "Health check attempt $attempt/$max_retries failed; retrying..."
-              if [ "$attempt" -lt "$max_retries" ]; then
-                sleep "$sleep_between"
-              fi
-            done
-
-            if [ "$success" -ne 1 ]; then
-              echo "Health check failed! Collecting logs and status..."
-
-              # Try journalctl without sudo first, then with non-interactive sudo
-              if journalctl -u "${service}" -n 200 --no-pager -o cat >/dev/null 2>&1; then
-                echo "---- journalctl (without sudo) ----"
-                journalctl -u "${service}" -n 200 --no-pager -o cat || true
-              elif sudo -n journalctl -u "${service}" -n 200 --no-pager -o cat >/dev/null 2>&1; then
-                echo "---- journalctl (with sudo -n) ----"
-                sudo -n journalctl -u "${service}" -n 200 --no-pager -o cat || true
-              else
-                echo "Cannot run 'journalctl' non-interactively (sudo would prompt)."
-                echo "Showing fallback logs (if available):"
-                if [ -f /var/log/syslog ]; then
-                  echo "---- /var/log/syslog (last 200 lines) ----"
-                  tail -n 200 /var/log/syslog || true
-                elif [ -f /var/log/messages ]; then
-                  echo "---- /var/log/messages (last 200 lines) ----"
-                  tail -n 200 /var/log/messages || true
-                else
-                  echo "No fallback logs found."
-                fi
-              fi
-
-              # Show systemctl status if possible (non-interactive)
-              if run_priv systemctl status "${service}" --no-pager >/dev/null 2>&1; then
-                echo "---- systemctl status ----"
-                run_priv systemctl status "${service}" --no-pager || true
-              else
-                echo "Cannot run 'systemctl status' non-interactively."
-              fi
-
-              exit 1
-            fi
-
-            # Cleanup old releases (keep 5 most recent)
-            ls -1dt "${release_dir}"/* 2>/dev/null | tail -n +6 | xargs -r rm -rf || true
+            # Bersihkan rilis lama (sisakan 5 terbaru)
+            ls -1dt /srv/rusdi/releases/* | tail -n +6 | xargs -r rm -rf
