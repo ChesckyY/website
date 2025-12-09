@@ -19,8 +19,6 @@ jobs:
           latest: true
           fileName: "app.zip"
 
-      # Removed ssh-keyscan to avoid rate-limiting issues (Connection Reset)
-      
       - name: Copy app.zip to server
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -29,7 +27,7 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           port: 22
           source: "app.zip"
-          target: "/srv/rusdi/" # Upload to /tmp first to avoid permission issues
+          target: "/srv/rusdi/" # User requested change back to /srv/rusdi/
           timeout: 60s
           command_timeout: 10m
 
@@ -47,9 +45,9 @@ jobs:
             ts="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
             mkdir -p "/srv/rusdi/releases/$ts"
 
-            # Unzip from temp
-            unzip -o /tmp/app.zip -d "/srv/rusdi/releases/$ts"
-            rm /tmp/app.zip
+            # Unzip from /srv/rusdi/app.zip (since we uploaded there)
+            unzip -o /srv/rusdi/app.zip -d "/srv/rusdi/releases/$ts"
+            rm /srv/rusdi/app.zip
 
             # Install dependencies
             cd "/srv/rusdi/releases/$ts"
@@ -65,9 +63,10 @@ jobs:
             # Restart service
             sudo systemctl restart rusdi
 
-            # Health Check
-            sleep 15
-            curl -fsS http://localhost:3000/health || (echo "Health check failed! Last logs:"; journalctl -u rusdi -n 50 --no-pager; exit 1)
+            # Health Check (Wait 20s for slow startups)
+            sleep 20
+            # If failed, read the error log file instead of journalctl (requires no sudo if owned by user)
+            curl -fsS http://localhost:3000/health || (echo "Health check failed! Last logs:" && tail -n 50 /var/log/rusdi/rusdi.err.log && exit 1)
 
             # Cleanup
             ls -1dt /srv/rusdi/releases/* | tail -n +6 | xargs -r rm -rf
