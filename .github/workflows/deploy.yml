@@ -63,10 +63,28 @@ jobs:
             # Restart service
             sudo systemctl restart rusdi
 
-            # Health Check (Wait 20s for slow startups)
-            sleep 20
-            # If failed, read the error log file instead of journalctl (requires no sudo if owned by user)
-            curl -fsS http://localhost:3000/health || (echo "Health check failed! Last logs:" && tail -n 50 /var/log/rusdi/rusdi.err.log && exit 1)
+            # Health Check with retries (wait for slow startups)
+            max_retries=6
+            sleep_between=5
+            attempt=0
+            success=0
+            while [ $attempt -lt $max_retries ]; do
+              attempt=$((attempt + 1))
+              sleep $sleep_between
+              if curl -fsS http://localhost:3000/health >/dev/null 2>&1; then
+                success=1
+                echo "Health check passed on attempt $attempt"
+                break
+              fi
+              echo "Health check attempt $attempt/$max_retries failed; retrying..."
+            done
 
-            # Cleanup
+            if [ "$success" -ne 1 ]; then
+              echo "Health check failed! Last logs:"
+              # Show recent logs for the rusdi service, or general system logs if that fails
+              sudo journalctl -u rusdi -n 200 --no-pager -o cat || sudo journalctl -xe --no-pager -n 200
+              exit 1
+            fi
+
+            # Cleanup (keep 5 most recent)
             ls -1dt /srv/rusdi/releases/* | tail -n +6 | xargs -r rm -rf
